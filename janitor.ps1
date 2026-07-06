@@ -35,3 +35,40 @@ try {
         }
     }
  
+    # -----------------------------------------------------------------------
+    # Per-user cleanup
+    # -----------------------------------------------------------------------
+    $profiles = Get-ChildItem 'C:\Users' -Directory -Force -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -notmatch '^(Default|All Users|Default User|Public)$' }
+ 
+    Write-Host "Clearing per-user caches for $($profiles.Count) profile(s)..."
+ 
+    # Data-driven list of cache targets so adding/removing one is a single line
+    $cacheTemplates = @(
+        '{0}\AppData\Local\Temp',
+        '{0}\AppData\Local\Google\Chrome\User Data\*\Cache',
+        '{0}\AppData\Local\Google\Chrome\User Data\*\Code Cache',
+        '{0}\AppData\Local\Google\Chrome\User Data\*\GPUCache',
+        '{0}\AppData\Local\Microsoft\Edge\User Data\*\Cache',
+        '{0}\AppData\Local\Microsoft\Edge\User Data\*\Code Cache',
+        '{0}\AppData\Local\Microsoft\Edge\User Data\*\GPUCache',
+        '{0}\AppData\Local\Mozilla\Firefox\Profiles\*\cache2',
+        '{0}\AppData\Roaming\Microsoft\Teams\Cache',
+        '{0}\AppData\Roaming\Microsoft\Teams\Code Cache',
+        '{0}\AppData\Roaming\Microsoft\Teams\GPUCache',
+        '{0}\AppData\Roaming\Zoom\data',
+        '{0}\AppData\Roaming\Zoom\bin\cef\Cache',
+        '{0}\AppData\Roaming\Zoom\logs'
+    )
+ 
+    foreach ($p in $profiles) {
+        foreach ($template in $cacheTemplates) {
+            Clear-Path ($template -f $p.FullName)
+        }
+ 
+        if ($IncludeLooseFiles) {
+            Clear-Path "$($p.FullName)\Downloads\*.tmp"
+            Clear-Path "$($p.FullName)\Downloads\*.log"
+            Clear-Path "$($p.FullName)\Documents\*.dmp"
+        }
+    }
