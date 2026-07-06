@@ -19,3 +19,19 @@ try {
         }
     }
  
+    # -----------------------------------------------------------------------
+    # System-wide cleanup
+    # -----------------------------------------------------------------------
+    Write-Host "Clearing system temp locations..."
+    Clear-Path "C:\Windows\Temp"
+    Clear-Path "C:\Windows\Prefetch"
+    Clear-Path "C:\Windows\SoftwareDistribution\Download"
+    Clear-Path "C:\Windows\Logs\CBS"
+ 
+    if ($IncludeRecycleBin) {
+        if ($PSCmdlet.ShouldProcess("Recycle Bin", "Empty")) {
+            try { Clear-RecycleBin -Force -ErrorAction Stop }
+            catch { Write-Warning "Could not empty Recycle Bin: $_" }
+        }
+    }
+ 
