@@ -72,3 +72,25 @@ try {
             Clear-Path "$($p.FullName)\Documents\*.dmp"
         }
     }
+
+    # -----------------------------------------------------------------------
+    # Component store cleanup (optional, slow)
+    # -----------------------------------------------------------------------
+    if ($IncludeComponentCleanup) {
+        if ($PSCmdlet.ShouldProcess("WinSxS component store", "DISM StartComponentCleanup")) {
+            Write-Host "`nRunning DISM component cleanup, this can take several minutes..."
+            try {
+                & "$env:SystemRoot\System32\dism.exe" /Online /Cleanup-Image /StartComponentCleanup
+            } catch {
+                Write-Warning "DISM cleanup failed: $_"
+            }
+        }
+    }
+}
+finally {
+    # Always restart anything we stopped, even if the script errored above
+    foreach ($svc in $servicesStopped) {
+        try { Start-Service $svc -ErrorAction Stop }
+        catch { Write-Warning "Could not restart $svc`: $_" }
+    }
+}
