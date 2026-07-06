@@ -94,3 +94,50 @@ finally {
         catch { Write-Warning "Could not restart $svc`: $_" }
     }
 }
+
+# ---------------------------------------------------------------------------
+# Measure results
+# ---------------------------------------------------------------------------
+ 
+$after    = (Get-PSDrive $driveLetter).Free
+$startGB  = [math]::Round($before / 1GB, 2)
+$endGB    = [math]::Round($after  / 1GB, 2)
+$gainedGB = [math]::Round($endGB - $startGB, 2)
+ 
+Write-Host "`nMeasuring per-profile sizes in parallel..."
+ 
+$jobs = foreach ($p in $profiles) {
+    Start-Job -ScriptBlock {
+        param($path, $name)
+        try {
+            # Exclude reparse points (junctions/symlinks) - old profiles can contain
+            # self-referencing junctions (e.g. legacy "Application Data") that cause
+            # Get-ChildItem to throw Win32Exception mid-recursion even with
+            # -ErrorAction SilentlyContinue. -Ignore truly discards rather than just
+            # suppressing display, which matters when running inside a job.
+            $bytes = (Get-ChildItem -LiteralPath $path -Force -File -Recurse `
+                        -Attributes !ReparsePoint -ErrorAction Ignore |
+                      Measure-Object -Sum Length).Sum
+        } catch {
+            $bytes = 0
+        }
+        [pscustomobject]@{
+            Profile = $name
+            SizeGB  = [math]::Round((([double]$bytes) / 1GB), 2)
+            Path    = $path
+        }
+    } -ArgumentList $p.FullName, $p.Name
+}
+ 
+$profileSizes = $jobs | Wait-Job | Receive-Job -ErrorAction SilentlyContinue
+$jobs | Remove-Job -Force
+ 
+$ProfileTable = $profileSizes |
+    Sort-Object SizeGB -Descending |
+    Format-Table -AutoSize Profile, SizeGB, Path |
+    Out-String -Width 4096
+ 
+Show-SummaryBox -StartGB $startGB -GainedGB $gainedGB -EndGB $endGB -Profiles $ProfileTable
+ 
+Stop-Transcript | Out-Null
+Write-Host "Full log saved to: $logPath"
