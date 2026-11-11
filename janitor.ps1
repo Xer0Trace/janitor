@@ -1,226 +1,301 @@
-[CmdletBinding(SupportsShouldProcess)]
-param(
-    [switch]$IncludeRecycleBin,
-    [switch]$IncludeComponentCleanup,
-    [switch]$IncludeLooseFiles
-)
+# Paste the entire block into an elevated PowerShell, or run .\janitor.ps1.
+# Preview a saved copy with .\janitor.ps1 -Preview (or -WhatIf).
+& {
+    if ($args.Count -gt 1 -or ($args.Count -eq 1 -and $args[0] -notin '-Preview', '-WhatIf')) {
+        throw 'Usage: .\janitor.ps1 [-Preview | -WhatIf]'
+    }
+    $preview = $WhatIfPreference -or $args.Count -eq 1
+    $ErrorActionPreference = 'Stop'
+    $PSNativeCommandUseErrorActionPreference = $false
 
-$ErrorActionPreference = 'Continue'
-$logPath = Join-Path $env:TEMP "Cleanup-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
-Start-Transcript -Path $logPath -Append | Out-Null
-Write-Host "Logging to $logPath`n"
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-function Clear-Path {
-    <#
-        Removes the contents of a folder (supports wildcards). Uses robocopy /MIR
-        against an empty scratch folder for speed on large/cache-heavy directories,
-        falling back to Remove-Item if robocopy isn't usable for some reason.
-    #>
-    param([Parameter(Mandatory)][string]$Path)
-
-    if ([string]::IsNullOrWhiteSpace($Path)) { return }
-
-    $targets = @()
-    if ($Path -match '\*') {
-        $targets = Get-Item -Path $Path -Force -ErrorAction SilentlyContinue
-    } elseif (Test-Path -Path $Path) {
-        $targets = @(Get-Item -Path $Path -Force)
+    function Confirm-Deletion([string]$message) {
+        $choices = [System.Management.Automation.Host.ChoiceDescription[]] @('&No', '&Yes')
+        try {
+            return ($Host.UI.PromptForChoice('Confirm permanent deletion', $message, $choices, 0) -eq 1)
+        } catch {
+            Write-Warning "Confirmation unavailable. Skipping deletion. $_"
+            return $false
+        }
     }
 
-    foreach ($target in $targets) {
-        if (-not (Test-Path $target.FullName)) { continue }
-        if (-not $PSCmdlet.ShouldProcess($target.FullName, "Clear contents")) { continue }
-
-        $empty = Join-Path $env:TEMP ("empty_" + [guid]::NewGuid().ToString('N'))
-        New-Item -ItemType Directory -Path $empty -Force | Out-Null
+    function Get-DownloadsFolder {
+        if (-not ('Janitor.NativeFolders' -as [type])) {
+            Add-Type -Namespace Janitor -Name NativeFolders -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("shell32.dll", ExactSpelling = true)]
+public static extern int SHGetKnownFolderPath(ref System.Guid folderId, uint flags,
+    System.IntPtr token, out System.IntPtr path);
+'@
+        }
+        $id = [guid]'374DE290-123F-4565-9164-39C4925E467B'
+        $pointer = [IntPtr]::Zero
         try {
-            & robocopy.exe $empty $target.FullName /MIR /NFL /NDL /NJH /NJS /NC /NS /R:0 /W:0 | Out-Null
-        } catch {
-            Get-ChildItem -Path $target.FullName -Force -Recurse -ErrorAction SilentlyContinue |
-                Remove-Item -Force -Recurse -ErrorAction SilentlyContinue
+            # KF_FLAG_DONT_VERIFY also returns the configured path if the folder is missing.
+            $result = [Janitor.NativeFolders]::SHGetKnownFolderPath(
+                [ref]$id, 0x4000, [IntPtr]::Zero, [ref]$pointer)
+            if ($result -ne 0) { throw ('Windows returned 0x{0:X8} for Downloads.' -f $result) }
+            return [Runtime.InteropServices.Marshal]::PtrToStringUni($pointer)
         } finally {
-            Remove-Item -Path $empty -Force -Recurse -ErrorAction SilentlyContinue
+            [Runtime.InteropServices.Marshal]::FreeCoTaskMem($pointer)
         }
     }
-}
 
-function Show-SummaryBox {
-    param(
-        [double]$StartGB,
-        [double]$GainedGB,
-        [double]$EndGB,
-        [string]$Profiles
-    )
+    function Get-SafeDownloadsPath {
+        $configuredPath = Get-DownloadsFolder
+        if ($configuredPath -notmatch '^[a-zA-Z]:\\') {
+            throw "Downloads must be on a local drive. Configured path: $configuredPath"
+        }
+        $path = [IO.Path]::GetFullPath($configuredPath).TrimEnd('\')
+        $root = [IO.Path]::GetPathRoot($configuredPath)
+        $drive = [IO.DriveInfo]::new($root)
+        if ($drive.DriveType -notin 'Fixed', 'Removable') {
+            throw "Downloads is not on a fixed or removable local drive: $path"
+        }
 
-    $sentence   = "You started with $StartGB GB, gained $GainedGB GB, for a total of $EndGB GB."
-    $title      = "Cleanup Summary"
-    $maxWidth   = [Math]::Max(40, [Math]::Min(120, $Host.UI.RawUI.WindowSize.Width - 2))
-    $innerWidth = [Math]::Min($maxWidth - 4, [Math]::Max($sentence.Length, $title.Length))
-    $width      = $innerWidth + 4
-    $bar        = "-" * ($width - 2)
-
-    function CenterLine([string]$text, [int]$width) {
-        if ($text.Length -gt ($width - 2)) { $text = $text.Substring(0, $width - 5) + "..." }
-        $pad   = $width - 2 - $text.Length
-        $left  = [Math]::Floor($pad / 2)
-        $right = $pad - $left
-        "|" + (" " * $left) + $text + (" " * $right) + "|"
-    }
-
-    Write-Host ""
-    Write-Host ("+" + $bar + "+")
-    Write-Host (CenterLine $title $width)
-    Write-Host ("|" + (" " * ($width - 2)) + "|")
-    Write-Host (CenterLine $sentence $width)
-    Write-Host ("+" + $bar + "+")
-    Write-Host ""
-    Write-Host $Profiles
-}
-
-# ---------------------------------------------------------------------------
-# Setup
-# ---------------------------------------------------------------------------
-
-$driveLetter = ($env:SystemDrive -replace ':$', '')
-$before      = (Get-PSDrive $driveLetter).Free
-$services    = @('wuauserv', 'bits')
-$servicesStopped = @()
-
-try {
-    # Stop update services only long enough to clear SoftwareDistribution\Download
-    foreach ($svc in $services) {
-        $s = Get-Service -Name $svc -ErrorAction SilentlyContinue
-        if ($s -and $s.Status -eq 'Running') {
-            if ($PSCmdlet.ShouldProcess($svc, "Stop service")) {
-                try { Stop-Service $svc -Force -ErrorAction Stop; $servicesStopped += $svc }
-                catch { Write-Warning "Could not stop $svc`: $_" }
+        $protectedPaths = @(
+            $root, $env:USERPROFILE, $env:PUBLIC, $env:SystemRoot,
+            $env:ProgramData, $env:ProgramFiles, ${env:ProgramFiles(x86)},
+            [Environment]::GetFolderPath('DesktopDirectory'),
+            [Environment]::GetFolderPath('MyDocuments'),
+            [Environment]::GetFolderPath('MyPictures'),
+            [Environment]::GetFolderPath('MyMusic'),
+            [Environment]::GetFolderPath('MyVideos'),
+            $env:LOCALAPPDATA, $env:APPDATA
+        )
+        foreach ($protectedPath in $protectedPaths) {
+            if ([string]::IsNullOrWhiteSpace($protectedPath)) { continue }
+            $protectedPath = [IO.Path]::GetFullPath($protectedPath).TrimEnd('\')
+            if ($path -eq $protectedPath -or
+                $protectedPath.StartsWith("$path\", [StringComparison]::OrdinalIgnoreCase)) {
+                throw "Downloads overlaps a protected folder: $path"
             }
         }
+        foreach ($systemPath in @($env:SystemRoot, $env:ProgramData, $env:ProgramFiles,
+                ${env:ProgramFiles(x86)}, $env:LOCALAPPDATA, $env:APPDATA)) {
+            if ($systemPath -and $path.StartsWith("$systemPath\", [StringComparison]::OrdinalIgnoreCase)) {
+                throw "Downloads points inside a system or application folder: $path"
+            }
+        }
+        if (-not (Test-Path -LiteralPath $path -PathType Container)) { return }
+        for ($folder = [IO.DirectoryInfo]::new($path); $folder; $folder = $folder.Parent) {
+            if ($folder.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                throw "Downloads uses a link or reparse point: $($folder.FullName)"
+            }
+        }
+        return $path
     }
 
-    # -----------------------------------------------------------------------
-    # System-wide cleanup
-    # -----------------------------------------------------------------------
-    Write-Host "Clearing system temp locations..."
-    Clear-Path "C:\Windows\Temp"
-    Clear-Path "C:\Windows\Prefetch"
-    Clear-Path "C:\Windows\SoftwareDistribution\Download"
-    Clear-Path "C:\Windows\Logs\CBS"
-
-    if ($IncludeRecycleBin) {
-        if ($PSCmdlet.ShouldProcess("Recycle Bin", "Empty")) {
-            try { Clear-RecycleBin -Force -ErrorAction Stop }
-            catch { Write-Warning "Could not empty Recycle Bin: $_" }
-        }
-    }
-
-    # -----------------------------------------------------------------------
-    # Per-user cleanup
-    # -----------------------------------------------------------------------
-    $profiles = Get-ChildItem 'C:\Users' -Directory -Force -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -notmatch '^(Default|All Users|Default User|Public)$' }
-
-    Write-Host "Clearing per-user caches for $($profiles.Count) profile(s)..."
-
-    # Data-driven list of cache targets so adding/removing one is a single line
-    $cacheTemplates = @(
-        '{0}\AppData\Local\Temp',
-        '{0}\AppData\Local\Google\Chrome\User Data\*\Cache',
-        '{0}\AppData\Local\Google\Chrome\User Data\*\Code Cache',
-        '{0}\AppData\Local\Google\Chrome\User Data\*\GPUCache',
-        '{0}\AppData\Local\Microsoft\Edge\User Data\*\Cache',
-        '{0}\AppData\Local\Microsoft\Edge\User Data\*\Code Cache',
-        '{0}\AppData\Local\Microsoft\Edge\User Data\*\GPUCache',
-        '{0}\AppData\Local\Mozilla\Firefox\Profiles\*\cache2',
-        '{0}\AppData\Roaming\Microsoft\Teams\Cache',
-        '{0}\AppData\Roaming\Microsoft\Teams\Code Cache',
-        '{0}\AppData\Roaming\Microsoft\Teams\GPUCache',
-        '{0}\AppData\Roaming\Zoom\data',
-        '{0}\AppData\Roaming\Zoom\bin\cef\Cache',
-        '{0}\AppData\Roaming\Zoom\logs'
-    )
-
-    foreach ($p in $profiles) {
-        foreach ($template in $cacheTemplates) {
-            Clear-Path ($template -f $p.FullName)
-        }
-
-        if ($IncludeLooseFiles) {
-            Clear-Path "$($p.FullName)\Downloads\*.tmp"
-            Clear-Path "$($p.FullName)\Downloads\*.log"
-            Clear-Path "$($p.FullName)\Documents\*.dmp"
-        }
-    }
-
-    # -----------------------------------------------------------------------
-    # Component store cleanup (optional, slow)
-    # -----------------------------------------------------------------------
-    if ($IncludeComponentCleanup) {
-        if ($PSCmdlet.ShouldProcess("WinSxS component store", "DISM StartComponentCleanup")) {
-            Write-Host "`nRunning DISM component cleanup, this can take several minutes..."
+    function Clear-DownloadsContents([string]$path) {
+        # Delete ordinary directories bottom-up. Never recurse through a reparse point.
+        foreach ($item in Get-ChildItem -LiteralPath $path -Force) {
             try {
-                & "$env:SystemRoot\System32\dism.exe" /Online /Cleanup-Image /StartComponentCleanup
+                if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                    if ($item.LinkType -notin 'Junction', 'SymbolicLink') {
+                        Write-Warning "Skipped a special file or folder: $($item.FullName)"
+                        continue
+                    }
+                    if ($item.PSIsContainer) {
+                        [IO.Directory]::Delete($item.FullName, $false)
+                    } else {
+                        [IO.File]::Delete($item.FullName)
+                    }
+                } elseif ($item.PSIsContainer) {
+                    Clear-DownloadsContents $item.FullName
+                    # Non-recursive deletion fails if anything remains in the directory.
+                    [IO.Directory]::Delete($item.FullName, $false)
+                } else {
+                    Remove-Item -LiteralPath $item.FullName -Force -Confirm:$false
+                }
             } catch {
-                Write-Warning "DISM cleanup failed: $_"
+                Write-Warning "Could not delete '$($item.FullName)'. $_"
             }
         }
     }
-}
-finally {
-    # Always restart anything we stopped, even if the script errored above
-    foreach ($svc in $servicesStopped) {
-        try { Start-Service $svc -ErrorAction Stop }
-        catch { Write-Warning "Could not restart $svc`: $_" }
+
+    function Invoke-MaintenanceCommand([string]$name, [string[]]$arguments) {
+        Write-Host "`nRunning $name $($arguments -join ' ')"
+        & (Join-Path $systemTools $name) @arguments | Out-Host
+        $code = $LASTEXITCODE
+        Write-Host "$name exit code: $code"
+        if ($code -in 1641, 3010) {
+            Write-Warning "$name reported that Windows requires a restart."
+        } elseif ($code -ne 0) {
+            Write-Warning "$name returned a nonzero exit code. See the command output above."
+        }
+        return $code
     }
-}
 
-# ---------------------------------------------------------------------------
-# Measure results
-# ---------------------------------------------------------------------------
+    function Invoke-DiskCleanup([string[]]$requestedHandlers) {
+        $registryPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VolumeCaches'
+        $handlers = @(Get-ChildItem -LiteralPath $registryPath)
+        $selected = @($handlers | Where-Object { $_.PSChildName -in $requestedHandlers })
+        foreach ($name in $requestedHandlers) {
+            if ($name -notin $selected.PSChildName) {
+                Write-Warning "This Windows installation has no Disk Cleanup handler named '$name'."
+            }
+        }
+        if ($selected.Count -eq 0) { return }
+        $cleanmgr = Join-Path $systemTools 'cleanmgr.exe'
+        if (-not (Test-Path -LiteralPath $cleanmgr -PathType Leaf)) {
+            throw 'Disk Cleanup (cleanmgr.exe) is unavailable.'
+        }
 
-$after    = (Get-PSDrive $driveLetter).Free
-$startGB  = [math]::Round($before / 1GB, 2)
-$endGB    = [math]::Round($after  / 1GB, 2)
-$gainedGB = [math]::Round($endGB - $startGB, 2)
-
-Write-Host "`nMeasuring per-profile sizes in parallel..."
-
-$jobs = foreach ($p in $profiles) {
-    Start-Job -ScriptBlock {
-        param($path, $name)
+        $usedFlags = @($handlers | ForEach-Object { $_.GetValueNames() })
+        $profile = 9999
+        while ($profile -ge 0 -and ('StateFlags{0:D4}' -f $profile) -in $usedFlags) { $profile-- }
+        if ($profile -lt 0) { throw 'No unused Disk Cleanup profile number was found.' }
+        $flag = 'StateFlags{0:D4}' -f $profile
+        $createdFlags = @()
         try {
-            # Exclude reparse points (junctions/symlinks) - old profiles can contain
-            # self-referencing junctions (e.g. legacy "Application Data") that cause
-            # Get-ChildItem to throw Win32Exception mid-recursion even with
-            # -ErrorAction SilentlyContinue. -Ignore truly discards rather than just
-            # suppressing display, which matters when running inside a job.
-            $bytes = (Get-ChildItem -LiteralPath $path -Force -File -Recurse `
-                        -Attributes !ReparsePoint -ErrorAction Ignore |
-                      Measure-Object -Sum Length).Sum
+            # Enable only the selected categories in an unused profile.
+            foreach ($handler in $selected) {
+                New-ItemProperty -LiteralPath $handler.PSPath -Name $flag -Value 2 -PropertyType DWord |
+                    Out-Null
+                $createdFlags += $handler.PSPath
+            }
+            Write-Host "`nRunning Windows Disk Cleanup for:"
+            $selected.PSChildName | ForEach-Object { Write-Host "  $_" }
+            $process = Start-Process -FilePath $cleanmgr -ArgumentList "/sagerun:$profile" -Wait -PassThru
+            if ($process.ExitCode -ne 0) {
+                Write-Warning "Disk Cleanup returned exit code $($process.ExitCode)."
+            }
+        } finally {
+            foreach ($path in $createdFlags) {
+                try {
+                    Remove-ItemProperty -LiteralPath $path -Name $flag -Confirm:$false
+                } catch {
+                    Write-Warning "Could not remove temporary profile flag $flag at '$path'. $_"
+                }
+            }
+        }
+    }
+
+    $handlers = @(
+        'Update Cleanup',
+        'Delivery Optimization Files',
+        'Thumbnail Cache',
+        'Device Driver Packages',
+        'Windows Defender',
+        'Windows Error Reporting Files',
+        'Feedback Hub Archive log files',
+        'Temporary Files',
+        'Internet Cache Files',
+        'D3D Shader Cache',
+        'Temporary Setup Files'
+    )
+    if ($preview) {
+        Write-Host 'Preview only. The active Windows account would get separate confirmations for Downloads and Recycle Bin.'
+        try { Write-Host "Downloads: $(Get-DownloadsFolder)" } catch { Write-Warning $_ }
+        Write-Host 'Maintenance order: DISM CheckHealth, ScanHealth, RestoreHealth, SFC /scannow, DISM StartComponentCleanup.'
+        Write-Host 'Disk Cleanup handlers:'
+        $handlers | ForEach-Object { Write-Host "  $_" }
+        return
+    }
+
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        Write-Warning 'Open PowerShell using Run as administrator, then paste or run this script again.'
+        return
+    }
+    if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
+        Write-Warning 'Use an elevated 64-bit PowerShell session on this 64-bit installation of Windows.'
+        return
+    }
+
+    $systemTools = Join-Path $env:SystemRoot 'System32'
+    $mutex = [Threading.Mutex]::new($false, 'Global\Janitor.WindowsCleanup')
+    $lockHeld = $false
+    $transcribing = $false
+    try {
+        try { $lockHeld = $mutex.WaitOne(0) }
+        catch [Threading.AbandonedMutexException] { $lockHeld = $true }
+        if (-not $lockHeld) {
+            Write-Warning 'Janitor is already running in another session.'
+            return
+        }
+        $logDirectory = Join-Path $env:LOCALAPPDATA 'Janitor\Logs'
+        try {
+            New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
+            $logPath = Join-Path $logDirectory "Cleanup-$(Get-Date -Format 'yyyyMMdd-HHmmss-fff').log"
+            Start-Transcript -Path $logPath | Out-Null
+            $transcribing = $true
+            Write-Host "Logging to $logPath"
         } catch {
-            $bytes = 0
+            Write-Warning "Could not start the transcript. $_"
         }
-        [pscustomobject]@{
-            Profile = $name
-            SizeGB  = [math]::Round((([double]$bytes) / 1GB), 2)
-            Path    = $path
+        $systemDrive = [IO.DriveInfo]::new($env:SystemDrive)
+        $before = $systemDrive.AvailableFreeSpace
+        Write-Host "Personal cleanup account: $($identity.Name)"
+
+        try {
+            $downloads = Get-SafeDownloadsPath
+            if (-not $downloads) {
+                Write-Host 'The configured Downloads folder is missing.'
+            } elseif (Confirm-Deletion "Permanently delete all contents of '$downloads'?") {
+                if ((Get-SafeDownloadsPath) -ne $downloads) { throw 'The Downloads path changed.' }
+                Clear-DownloadsContents $downloads
+                if (Get-ChildItem -LiteralPath $downloads -Force | Select-Object -First 1) {
+                    Write-Warning 'Some items remain in Downloads. See the warnings above.'
+                } else {
+                    Write-Host 'Downloads is empty.'
+                }
+            }
+        } catch {
+            Write-Warning "Could not finish Downloads cleanup. $_"
         }
-    } -ArgumentList $p.FullName, $p.Name
-}
+        if (Confirm-Deletion "Permanently empty the Recycle Bin for $($identity.Name) on all drives?") {
+            try {
+                Clear-RecycleBin -Force
+            } catch {
+                Write-Warning "Could not confirm that the Recycle Bin was emptied. $_"
+            }
+        }
 
-$profileSizes = $jobs | Wait-Job | Receive-Job -ErrorAction SilentlyContinue
-$jobs | Remove-Job -Force
+        $restoreCode = $null
+        $sfcCode = $null
+        $dismArguments = @('/Online', '/Cleanup-Image')
+        try {
+            $null = Invoke-MaintenanceCommand 'dism.exe' ($dismArguments + '/CheckHealth')
+            $null = Invoke-MaintenanceCommand 'dism.exe' ($dismArguments + '/ScanHealth')
+            $restoreCode = Invoke-MaintenanceCommand 'dism.exe' ($dismArguments + '/RestoreHealth')
+            if ($restoreCode -eq 0) {
+                $sfcCode = Invoke-MaintenanceCommand 'sfc.exe' '/scannow'
+                Write-Host 'See the Windows Resource Protection message above for the SFC result.'
+            } else {
+                Write-Warning 'SFC is pending a successful DISM RestoreHealth run.'
+            }
+        } catch {
+            Write-Warning "Could not finish the repair sequence. $_"
+        }
+        if ($restoreCode -eq 0 -and $sfcCode -eq 0) {
+            try {
+                $componentCode = Invoke-MaintenanceCommand 'dism.exe' ($dismArguments + '/StartComponentCleanup')
+                if ($componentCode -in 1641, 3010) {
+                    $handlers = $handlers | Where-Object { $_ -ne 'Update Cleanup' }
+                    Write-Warning 'Windows Update Cleanup is pending a restart.'
+                }
+            } catch {
+                Write-Warning "Could not run DISM component cleanup. $_"
+            }
+        } else {
+            $handlers = $handlers | Where-Object { $_ -ne 'Update Cleanup' }
+            Write-Warning 'Component and Windows Update cleanup are pending a successful repair sequence.'
+        }
+        try {
+            Invoke-DiskCleanup $handlers
+        } catch {
+            Write-Warning "Disk Cleanup could not finish. $_"
+        }
 
-$ProfileTable = $profileSizes |
-    Sort-Object SizeGB -Descending |
-    Format-Table -AutoSize Profile, SizeGB, Path |
-    Out-String -Width 4096
-
-Show-SummaryBox -StartGB $startGB -GainedGB $gainedGB -EndGB $endGB -Profiles $ProfileTable
-
-Stop-Transcript | Out-Null
-Write-Host "Full log saved to: $logPath"
+        $after = $systemDrive.AvailableFreeSpace
+        Write-Host ("`n{0} free space: {1:N2} GiB before, {2:N2} GiB after ({3:+0.00;-0.00;0.00} GiB change)." -f
+            $env:SystemDrive, ($before / 1GB), ($after / 1GB), (($after - $before) / 1GB))
+    } finally {
+        if ($lockHeld) { $mutex.ReleaseMutex() }
+        $mutex.Dispose()
+        if ($transcribing) {
+            Stop-Transcript | Out-Null
+            Write-Host "Log saved to $logPath"
+        }
+    }
+} @args
