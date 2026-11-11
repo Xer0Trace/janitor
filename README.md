@@ -1,90 +1,34 @@
 # Janitor
 
-## Overview
-This PowerShell script performs a **safe deep cleanup** of Windows systems.  
-It targets temporary files, caches, update leftovers, logs, and recycle bins across all user profiles while avoiding critical system files.  
-The script is designed to reclaim disk space without harming normal Windows operation.
+Open **64-bit Windows PowerShell 5.1 or PowerShell 7 as Administrator**. Open `janitor.ps1` in a text editor, copy the entire file, and paste it into the console as one block. Press Enter if the console is still waiting at the final line. You can also run the saved script from its folder.
 
----
-
-## ✨ Features
-- **System-wide cleanup**
-  - Windows Temp, Prefetch, and SoftwareDistribution caches  
-  - CBS servicing logs  
-  - Recycle Bin (all drives)
-
-- **Per-user cleanup**
-  - Temp folders  
-  - Browser caches (Chrome, Edge, Firefox)  
-  - Microsoft Teams and Zoom caches/logs  
-  - Installer leftovers (`*.tmp`, `*.log`)  
-  - Crash dumps (`*.dmp`)
-
-- **Service handling**
-  - Stops Windows Update (`wuauserv`) and BITS (`bits`) temporarily  
-  - Restarts services after cleanup  
-
-- **Component Store cleanup**
-  - Runs `dism.exe /Online /Cleanup-Image /StartComponentCleanup`  
-  - Safely reduces the size of the WinSxS folder  
-
-- **Space reporting**
-  - Reports free space before and after  
-  - Displays total GB freed  
-
----
-
-## 🚀 Usage
-
-### 1. Run as Administrator
-Open PowerShell **as Administrator**.
-
-### 2. Execute the script
 ```powershell
 .\janitor.ps1
+```
 
+If your session uses the `AllSigned` execution policy, use the paste instructions above. Running the unsigned `.ps1` file directly requires signing it under that policy.
 
----
-
-## Updated Script Header
+To preview the operations without running cleanup or repairs, run:
 
 ```powershell
-#Requires -RunAsAdministrator
-<#
-.SYNOPSIS
-    Safe Windows disk cleanup: system temp/cache locations + per-user browser/app caches,
-    with optional recycle-bin emptying and DISM component cleanup.
-
-.DESCRIPTION
-    Improvements over the original version:
-      - Elevation is enforced via #Requires (fails fast with a clear error instead of
-        silently doing nothing).
-      - Update services (wuauserv/bits) are guaranteed to restart via try/finally,
-        even if the script errors out midway.
-      - Destructive/slow steps (Recycle Bin, DISM cleanup, deleting .dmp/.log/.tmp files)
-        are opt-in switches, not silent defaults.
-      - -WhatIf / -Confirm supported so you can preview deletions first.
-      - Big cache folders are cleared with robocopy /MIR instead of Remove-Item -Recurse,
-        which is much faster on folders with tens of thousands of small files.
-      - Per-profile size reporting runs in parallel jobs instead of sequentially.
-      - Full run is logged to a transcript file.
-
-.PARAMETER IncludeRecycleBin
-    Also empties the Recycle Bin for all users.
-
-.PARAMETER IncludeComponentCleanup
-    Also runs DISM /StartComponentCleanup (can take several minutes; frees WinSxS space
-    but removes the ability to uninstall currently installed updates).
-
-.PARAMETER IncludeLooseFiles
-    Also deletes stray *.tmp/*.log files in Downloads and *.dmp files in Documents.
-    Off by default because dump/log files are sometimes needed for troubleshooting.
-
-.EXAMPLE
-    .\janitor.ps1 -WhatIf
-    Preview what would be deleted without deleting anything.
-
-.EXAMPLE
-    .\janitor.ps1 -IncludeRecycleBin -IncludeComponentCleanup
-#>
+.\janitor.ps1 -Preview
 ```
+
+`-WhatIf` is an alias for `-Preview`.
+
+## Downloads and Recycle Bin
+
+Janitor asks separately before permanently deleting the contents of your configured Downloads folder and before emptying your Recycle Bin across drives. Both prompts default to **No**. Check the displayed account and Downloads path, especially if you elevated PowerShell using a different account. Janitor leaves the Downloads folder itself in place and reports any items it could not remove. For redirected Downloads, it accepts ordinary folders on local drives and checks the path before deletion.
+
+## Windows maintenance
+
+1. Run DISM `/CheckHealth`, `/ScanHealth`, and `/RestoreHealth`.
+2. After a successful `/RestoreHealth`, run `sfc.exe /scannow`.
+3. After the repair commands return success, run DISM `/StartComponentCleanup`.
+4. Run the Windows Disk Cleanup handlers for the screenshot categories.
+
+Disk Cleanup covers Windows Update Cleanup, Delivery Optimization Files, thumbnails, old device driver packages, Microsoft Defender Antivirus cleanup, Windows error reports and feedback diagnostics, temporary files, Temporary Internet Files, DirectX Shader Cache, and temporary Windows installation files. The last category is included because it appears in the screenshot, where its checkbox was clear. Windows determines which files in each category are eligible. Janitor reports missing handlers and defers Windows Update Cleanup if the repair sequence fails or DISM component cleanup requires a restart.
+
+Janitor reports the change in free space on the Windows drive and saves a transcript under `%LOCALAPPDATA%\Janitor\Logs`. Review the Windows Resource Protection message in the console or transcript for the SFC result.
+
+[Microsoft's DISM and SFC instructions](https://support.microsoft.com/en-us/windows/experience/backup-recovery/using-the-system-file-checker-in-windows) · [Disk Cleanup command reference](https://learn.microsoft.com/windows-server/administration/windows-commands/cleanmgr) · [DISM component cleanup](https://learn.microsoft.com/windows-hardware/manufacture/desktop/clean-up-the-winsxs-folder)
