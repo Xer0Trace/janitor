@@ -1,20 +1,20 @@
 # Janitor
 
-Open **64-bit Windows PowerShell 5.1 or PowerShell 7 as Administrator**. Open `janitor.ps1` in a text editor, copy the entire file, and paste it into the console as one block. Press Enter if the console is still waiting at the final line. You can also run the saved script from its folder.
+## Download and run on Windows
+
+1. On [GitHub](https://github.com/Xer0Trace/janitor), select **Code → Download ZIP**.
+2. Extract the ZIP to a folder outside **Downloads**. Keep `Run-Janitor.cmd` and `janitor.ps1` together.
+3. Right-click **Run-Janitor.cmd**, choose **Run as administrator**, and approve the Windows prompt.
+
+To preview from PowerShell opened in the extracted folder, run:
 
 ```powershell
-.\janitor.ps1
+.\Run-Janitor.cmd -Preview
 ```
 
-If your session uses the `AllSigned` execution policy, use the paste instructions above. Running the unsigned `.ps1` file directly requires signing it under that policy.
+Preview requires no elevation and exits before making changes. `-WhatIf` also works. The launcher reads the adjacent PowerShell file and runs it as a console command, so it works under Windows PowerShell's `AllSigned` policy without changing that policy. Run it only from a copy you trust.
 
-To preview the operations without running cleanup or repairs, run:
-
-```powershell
-.\janitor.ps1 -Preview
-```
-
-`-WhatIf` is an alias for `-Preview`.
+You can also paste the entire contents of `janitor.ps1` into an elevated 64-bit PowerShell window, or run `.\janitor.ps1` directly when your execution policy permits it.
 
 ## Downloads and Recycle Bin
 
